@@ -1,0 +1,395 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bot>
+  <metadata>
+    <name>Deriv Duplicate Number Bot</name>
+    <version>1.0</version>
+    <description>Trades when same number appears twice consecutively. Uses martingale 3x on losses.</description>
+    <author>Trading Bot</author>
+    <strategy>duplicate_pattern_martingale</strategy>
+  </metadata>
+
+  <!-- Configuration Section -->
+  <config>
+    <api>
+      <endpoint>wss://ws.derivws.com/websockets/v3</endpoint>
+      <app_id>YOUR_APP_ID</app_id>
+      <token>YOUR_API_TOKEN</token>
+    </api>
+
+    <trading>
+      <base_stake>10</base_stake>
+      <martingale_multiplier>3</martingale_multiplier>
+      <max_martingale_level>3</max_martingale_level>
+      <contract_type>DIGITDIFF</contract_type>
+      <currency>USD</currency>
+      <duration_type>t</duration_type>
+      <duration_value>1</duration_value>
+      <market>synthetic_index</market>
+      <symbol>1HZ100V</symbol>
+    </trading>
+
+    <bot_control>
+      <enabled>true</enabled>
+      <max_trades>100</max_trades>
+      <session_timeout_seconds>3600</session_timeout_seconds>
+      <log_level>DEBUG</log_level>
+    </bot_control>
+  </config>
+
+  <!-- State Management -->
+  <state>
+    <session>
+      <account_id></account_id>
+      <balance>0</balance>
+      <currency>USD</currency>
+    </session>
+
+    <trading_state>
+      <current_martingale_level>1</current_martingale_level>
+      <last_number>-1</last_number>
+      <duplicate_detected>false</duplicate_detected>
+      <last_trade_status></last_trade_status>
+      <trades_executed>0</trades_executed>
+      <total_profit_loss>0</total_profit_loss>
+    </trading_state>
+
+    <history>
+      <numbers>
+        <number index="0">-1</number>
+      </numbers>
+      <trades>
+        <trade id="0">
+          <timestamp></timestamp>
+          <contract_id></contract_id>
+          <stake>0</stake>
+          <result></result>
+        </trade>
+      </trades>
+    </history>
+  </state>
+
+  <!-- Event Handlers -->
+  <handlers>
+    <!-- Connection Handler -->
+    <handler event="on_connect">
+      <action type="send_request">
+        <request>
+          <authorize>
+            <token>{config.api.token}</token>
+          </authorize>
+        </request>
+      </action>
+      <action type="log">Connected to Deriv API</action>
+    </handler>
+
+    <!-- Tick Handler - Main Logic -->
+    <handler event="on_tick">
+      <action type="extract_value">
+        <path>tick.quote</path>
+        <store_as>current_number</store_as>
+      </action>
+
+      <!-- Extract last digit if number is multi-digit -->
+      <action type="modulo">
+        <value>{current_number}</value>
+        <divisor>10</divisor>
+        <store_as>current_digit</store_as>
+      </action>
+
+      <!-- Check if duplicate pattern exists -->
+      <condition>
+        <if>
+          <equals>
+            <value1>{current_digit}</value1>
+            <value2>{state.trading_state.last_number}</value2>
+          </equals>
+          <then>
+            <!-- Duplicate found! -->
+            <action type="set_state">
+              <duplicate_detected>true</duplicate_detected>
+              <difference_value>{current_digit}</difference_value>
+            </action>
+
+            <!-- Calculate stake with martingale -->
+            <action type="multiply">
+              <base>{config.trading.base_stake}</base>
+              <multiplier>
+                <power_of>
+                  <base>{config.trading.martingale_multiplier}</base>
+                  <exponent>{state.trading_state.current_martingale_level - 1}</exponent>
+                </power_of>
+              </multiplier>
+              <store_as>current_stake</store_as>
+            </action>
+
+            <action type="log">
+              🎯 DUPLICATE DETECTED! Digit: {current_digit} | Stake: {current_stake} (Martingale Level: {state.trading_state.current_martingale_level})
+            </action>
+
+            <!-- Execute Trade -->
+            <action type="send_request">
+              <request>
+                <buy>
+                  <contract_type>{config.trading.contract_type}</contract_type>
+                  <currency>{config.trading.currency}</currency>
+                  <symbol>{config.trading.symbol}</symbol>
+                  <amount>{current_stake}</amount>
+                  <duration>{config.trading.duration_value}</duration>
+                  <duration_unit>{config.trading.duration_type}</duration_unit>
+                  <barrier>{current_digit}</barrier>
+                </buy>
+              </request>
+            </action>
+
+            <action type="store_trade">
+              <timestamp>{now}</timestamp>
+              <digit>{current_digit}</digit>
+              <stake>{current_stake}</stake>
+              <martingale_level>{state.trading_state.current_martingale_level}</martingale_level>
+            </action>
+          </then>
+          <else>
+            <!-- No duplicate, update last number -->
+            <action type="set_state">
+              <last_number>{current_digit}</last_number>
+            </action>
+          </else>
+        </if>
+      </condition>
+    </handler>
+
+    <!-- Trade Result Handler -->
+    <handler event="on_trade_result">
+      <action type="extract_value">
+        <path>result.status</path>
+        <store_as>trade_status</store_as>
+      </action>
+
+      <condition>
+        <if>
+          <equals>
+            <value1>{trade_status}</value1>
+            <value2>win</value2>
+          </equals>
+          <then>
+            <!-- WIN: Reset martingale, log profit -->
+            <action type="log">
+              ✅ WIN! Contract won. Resetting martingale.
+            </action>
+
+            <action type="set_state">
+              <current_martingale_level>1</current_martingale_level>
+              <last_trade_status>WIN</last_trade_status>
+            </action>
+
+            <action type="add_to_balance">
+              <value>{result.payout}</value>
+            </action>
+
+            <action type="increment">
+              <counter>trades_executed</counter>
+            </action>
+          </then>
+          <else>
+            <!-- LOSS: Increase martingale level -->
+            <action type="log">
+              ❌ LOSS! Activating martingale. Level {state.trading_state.current_martingale_level + 1}
+            </action>
+
+            <condition>
+              <if>
+                <less_than>
+                  <value1>{state.trading_state.current_martingale_level}</value1>
+                  <value2>{config.trading.max_martingale_level}</value2>
+                </less_than>
+                <then>
+                  <action type="set_state">
+                    <current_martingale_level>{state.trading_state.current_martingale_level + 1}</current_martingale_level>
+                    <last_trade_status>LOSS</last_trade_status>
+                  </action>
+                </then>
+                <else>
+                  <!-- Max martingale reached, reset -->
+                  <action type="log">
+                    ⚠️ MAX MARTINGALE REACHED! Resetting to level 1.
+                  </action>
+
+                  <action type="set_state">
+                    <current_martingale_level>1</current_martingale_level>
+                  </action>
+                </else>
+              </if>
+            </condition>
+
+            <action type="subtract_from_balance">
+              <value>{result.paid}</value>
+            </action>
+
+            <action type="increment">
+              <counter>trades_executed</counter>
+            </action>
+          </else>
+        </if>
+      </condition>
+
+      <!-- Update profit/loss -->
+      <action type="update_total_profit_loss">
+        <payout>{result.payout}</payout>
+        <paid>{result.paid}</paid>
+      </action>
+    </handler>
+
+    <!-- Balance Update Handler -->
+    <handler event="on_balance_update">
+      <action type="set_state">
+        <balance>{result.balance}</balance>
+      </action>
+
+      <action type="log">
+        💰 Balance: {result.balance} {result.currency}
+      </action>
+    </handler>
+
+    <!-- Error Handler -->
+    <handler event="on_error">
+      <action type="log">
+        🔴 ERROR: {error.message}
+      </action>
+
+      <condition>
+        <if>
+          <contains>
+            <text>{error.message}</text>
+            <substring>insufficient balance</substring>
+          </contains>
+          <then>
+            <action type="log">
+              🛑 BOT STOPPED: Insufficient balance to continue martingale progression.
+            </action>
+
+            <action type="stop_bot"/>
+          </then>
+        </if>
+      </condition>
+    </handler>
+
+    <!-- Session End Handler -->
+    <handler event="on_session_end">
+      <action type="log">
+        📊 SESSION SUMMARY
+        Total Trades: {state.trading_state.trades_executed}
+        Final Balance: {state.session.balance} {state.session.currency}
+        Total P/L: {state.trading_state.total_profit_loss}
+      </action>
+    </handler>
+  </handlers>
+
+  <!-- Trading Rules -->
+  <rules>
+    <rule id="duplicate_pattern">
+      <description>Execute trade when the same digit appears twice consecutively</description>
+      <condition>
+        <pattern type="consecutive_duplicate">
+          <compare field="last_tick_digit" with="current_tick_digit"/>
+        </pattern>
+      </condition>
+      <action>execute_trade_with_martingale</action>
+    </rule>
+
+    <rule id="martingale_progression">
+      <description>On loss, multiply stake by 3 up to max level</description>
+      <condition>
+        <event>trade_loss</event>
+      </condition>
+      <action>
+        <if_level_lt_max>
+          <increase_level/>
+          <recalculate_stake/>
+        </if_level_lt_max>
+        <if_level_eq_max>
+          <reset_level/>
+          <log_warning/>
+        </if_level_eq_max>
+      </action>
+    </rule>
+
+    <rule id="win_reset">
+      <description>Reset martingale on any win</description>
+      <condition>
+        <event>trade_win</event>
+      </condition>
+      <action>
+        <reset_martingale_level_to_1/>
+        <reset_last_number/>
+      </action>
+    </rule>
+
+    <rule id="safety_stop">
+      <description>Stop bot if balance drops below minimum or max trades reached</description>
+      <condition>
+        <or>
+          <balance_below_minimum/>
+          <trades_reached_maximum/>
+          <session_timeout_reached/>
+        </or>
+      </condition>
+      <action>
+        <stop_bot/>
+        <generate_report/>
+      </action>
+    </rule>
+  </rules>
+
+  <!-- Logging and Reports -->
+  <logging>
+    <log_file>deriv_bot_$(DATE).log</log_file>
+    <log_level>{config.bot_control.log_level}</log_level>
+    <console_output>true</console_output>
+
+    <log_entry type="trade_executed">
+      <format>[TRADE] Digit: {digit} | Stake: {stake} | Martingale: {level} | Time: {timestamp}</format>
+    </log_entry>
+
+    <log_entry type="trade_result">
+      <format>[RESULT] Status: {status} | Payout: {payout} | Balance: {balance}</format>
+    </log_entry>
+
+    <log_entry type="session_end">
+      <format>
+[SESSION REPORT]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Trades Executed: {trades_executed}
+Wins: {wins}
+Losses: {losses}
+Win Rate: {win_rate}%
+Total P/L: {total_profit_loss}
+Starting Balance: {starting_balance}
+Final Balance: {final_balance}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      </format>
+    </log_entry>
+  </logging>
+
+  <!-- Execution -->
+  <execution>
+    <startup>
+      <action>connect_to_api</action>
+      <action>authorize</action>
+      <action>subscribe_to_ticks</action>
+      <action>log>Bot started. Waiting for duplicate pattern...</action>
+    </startup>
+
+    <runtime>
+      <monitor event="tick" every="1s"/>
+      <monitor event="trade_result" every="1s"/>
+      <monitor event="balance_update" every="10s"/>
+    </runtime>
+
+    <shutdown>
+      <action>unsubscribe_ticks</action>
+      <action>close_open_positions</action>
+      <action>generate_session_report</action>
+      <action>disconnect</action>
+    </shutdown>
+  </execution>
+</bot>
